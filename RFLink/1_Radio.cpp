@@ -716,15 +716,15 @@ namespace RFLink { namespace Radio  {
 
             setPinMode(pins::TX_DATA, OUTPUT);
 
-            auto success = radio_SX1278->transmitDirect();
+            auto success = radio_SX1278->setOutputPower(13);
             if(success != 0) {
-              Serial.printf_P(PSTR("Failed to put hardware in TX mode (code=%i), we will try to reinitialize it later"), (int) success);
+              Serial.printf_P(PSTR("Failed setup hardware TX power (code=%i), we will try to reinitialize it later"), (int) success);
               hardwareProperlyInitialized = false;
             }
 
-            success = radio_SX1278->setOutputPower(13);
+            success = radio_SX1278->transmitDirect();
             if(success != 0) {
-              Serial.printf_P(PSTR("Failed setup hardware TX power (code=%i), we will try to reinitialize it later"), (int) success);
+              Serial.printf_P(PSTR("Failed to put hardware in TX mode (code=%i), we will try to reinitialize it later"), (int) success);
               hardwareProperlyInitialized = false;
             }
 
@@ -781,15 +781,15 @@ namespace RFLink { namespace Radio  {
 
             setPinMode(pins::TX_DATA, OUTPUT);
 
-            auto success = radio_SX1276->transmitDirect();
+            auto success = radio_SX1276->setOutputPower(13);
             if(success != 0) {
-              Serial.printf_P(PSTR("Failed to put hardware in TX mode (code=%i), we will try to reinitialize it later"), (int) success);
+              Serial.printf_P(PSTR("Failed setup hardware TX power (code=%i), we will try to reinitialize it later"), (int) success);
               hardwareProperlyInitialized = false;
             }
 
-            success = radio_SX1276->setOutputPower(13);
+            success = radio_SX1276->transmitDirect();
             if(success != 0) {
-              Serial.printf_P(PSTR("Failed setup hardware TX power (code=%i), we will try to reinitialize it later"), (int) success);
+              Serial.printf_P(PSTR("Failed to put hardware in TX mode (code=%i), we will try to reinitialize it later"), (int) success);
               hardwareProperlyInitialized = false;
             }
 
