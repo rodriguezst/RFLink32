@@ -33,8 +33,12 @@
 #if (defined(ESP32) || defined(ESP8266))
 // OLED display, 0.91" SSD1306 I2C
 // #define OLED_ENABLED
+#ifndef OLED_CONTRAST
 #define OLED_CONTRAST 32 // default 255 (max)
+#endif
+#ifndef OLED_FLIP
 #define OLED_FLIP true   // default false
+#endif
 
 // WIFI
 //#define RFLINK_WIFI_ENABLED
