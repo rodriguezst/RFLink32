@@ -89,7 +89,7 @@
 
 boolean Plugin_001(byte function, const char *string)
 {
-    if (string == NULL || RawSignal.Number == 0)
+    if (RawSignal.Number == 0 || RawSignal.Multiply == 0)
         return false;
 
    // byte HEconversiontype = 1; // 0=No conversion, 1=conversion to Elro 58 pulse protocol (same as FA500R Method 1)
