@@ -96,9 +96,6 @@ namespace RFLink {
 #ifdef SERIAL_ENABLED
       Serial.print(pbuffer);
 #endif
-#ifdef OLED_ENABLED
-      splash_OLED();
-#endif
 
 #if defined(ESP32) || (ESP8266)
       RFLink::Config::setup();
@@ -129,6 +126,7 @@ namespace RFLink {
 
 #ifdef OLED_ENABLED
       setup_OLED();
+      splash_OLED();
 #endif
 
 
