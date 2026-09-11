@@ -38,6 +38,10 @@ jobs:
       run: |
         pio run --project-conf .travis.platformio.ini --environment sonoff_bridge
 
+    - name: lilygo_lora32
+      run: |
+        pio run --project-conf .travis.platformio.ini --environment lilygo_lora32
+
     - name: Copy firmwares in 1 place
       if: github.event_name == 'push'
       run: |
@@ -46,10 +50,10 @@ jobs:
         cp .pio/build/ESP32_sw/firmware.bin firmwares/esp32-firmware-OTA.bin
         cp .pio/build/ESP32_sw/partitions.bin firmwares/esp32-partitions.bin
         cp .pio/build/sonoff_bridge/firmware.bin firmwares/sonoff_bridge-firmware.bin
-        cd firmwares
-        cp /home/runner/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin .
-        python ../tools/esp32-makeimg.py bootloader_dio_40m.bin esp32-partitions.bin boot_app0.bin esp32-firmware-OTA.bin esp32-full.img
-        cd ..
+        cp .pio/build/lilygo_lora32/firmware.bin firmwares/lilygo_lora32-firmware-OTA.bin
+        cp /home/runner/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin firmwares/boot_app0.bin
+        python tools/esp32-makeimg.py .pio/build/lilygo_lora32/bootloader.bin .pio/build/lilygo_lora32/partitions.bin firmwares/boot_app0.bin .pio/build/lilygo_lora32/firmware.bin firmwares/lilygo_lora32-full.img
+        python tools/esp32-makeimg.py .pio/build/ESP32_sw/bootloader.bin .pio/build/ESP32_sw/partitions.bin firmwares/boot_app0.bin .pio/build/ESP32_sw/firmware.bin firmwares/esp32-full.img
 
     - name: Publish firmware for Master branch
       if: github.ref == 'refs/heads/master' && github.event_name == 'push'
