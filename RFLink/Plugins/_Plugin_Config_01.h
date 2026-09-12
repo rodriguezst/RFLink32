@@ -150,6 +150,9 @@
 // Misc
 // -------------------
 #define PLUGIN_TX_076               // CAME TOP-432 Door Opener
+#ifdef ESP32
+#define PLUGIN_TX_078                  // CLEMSA Mastercode MV12 (experimental TX)
+#endif
 // -------------------
 //       -=#=-
 // -------------------
