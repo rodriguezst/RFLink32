@@ -31,6 +31,7 @@
 #include "11_Config.h"
 #include "12_Portal.h"
 #include "13_OTA.h"
+#include "14_BLE.h"
 
 #if (defined(__AVR_ATmega328P__) || defined(__AVR_ATmega2560__))
 #include <avr/power.h>
@@ -100,6 +101,9 @@ namespace RFLink {
 #if defined(ESP32) || (ESP8266)
       RFLink::Config::setup();
 #endif
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::setup();
+#endif
       RFLink::Radio::setup();
       RFLink::Signal::setup();
 
@@ -162,6 +166,10 @@ namespace RFLink {
       RFLink::Serial2Net::serverLoop();
 #endif // !RFLINK_SERIAL2NET_DISABLED
 
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::mainLoop();
+#endif
+
 #if defined(SERIAL_ENABLED)
       readSerialAndExecute();
 #endif
@@ -197,6 +205,10 @@ namespace RFLink {
         RFLink::Serial2Net::broadcastMessage(pbuffer);
 #endif // !RFLINK_SERIAL2NET_DISABLED
 
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+        RFLink::BLE::broadcastMessage(pbuffer);
+#endif
+
 #ifdef OLED_ENABLED
         print_OLED();
 #endif
@@ -219,6 +231,12 @@ namespace RFLink {
           RFLink::Serial2Net::broadcastMessage(F("\r\n"));
 #endif // !RFLINK_SERIAL2NET_DISABLED
 
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+        RFLink::BLE::broadcastMessage(buf);
+        if(end_of_line)
+          RFLink::BLE::broadcastMessage(F("\r\n"));
+#endif
+
       }
     }
 
@@ -230,7 +248,11 @@ namespace RFLink {
 #ifndef RFLINK_SERIAL2NET_DISABLED
       RFLink::Serial2Net::broadcastMessage(String(n).c_str());
 #endif // !RFLINK_SERIAL2NET_DISABLED
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::broadcastMessage(String(n).c_str());
+#endif
     }
+
 
     void sendRawPrint(unsigned long n)
     {
@@ -240,6 +262,9 @@ namespace RFLink {
 #ifndef RFLINK_SERIAL2NET_DISABLED
       RFLink::Serial2Net::broadcastMessage(String(n).c_str());
 #endif // !RFLINK_SERIAL2NET_DISABLED
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::broadcastMessage(String(n).c_str());
+#endif
     }
 
     void sendRawPrint(int n)
@@ -250,6 +275,9 @@ namespace RFLink {
 #ifndef RFLINK_SERIAL2NET_DISABLED
       RFLink::Serial2Net::broadcastMessage(String(n).c_str());
 #endif // !RFLINK_SERIAL2NET_DISABLED
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::broadcastMessage(String(n).c_str());
+#endif
     }
 
     void sendRawPrint(unsigned int n)
@@ -260,6 +288,9 @@ namespace RFLink {
 #ifndef RFLINK_SERIAL2NET_DISABLED
       RFLink::Serial2Net::broadcastMessage(String(n).c_str());
 #endif // !RFLINK_SERIAL2NET_DISABLED
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::broadcastMessage(String(n).c_str());
+#endif
     }
 
   void sendRawPrint(float f)
@@ -270,6 +301,9 @@ namespace RFLink {
 #ifndef RFLINK_SERIAL2NET_DISABLED
     RFLink::Serial2Net::broadcastMessage(String(f).c_str());
 #endif // !RFLINK_SERIAL2NET_DISABLED
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+    RFLink::BLE::broadcastMessage(String(f).c_str());
+#endif
   }
 
     void sendRawPrint(char c)
@@ -280,6 +314,9 @@ namespace RFLink {
 #ifndef RFLINK_SERIAL2NET_DISABLED
       RFLink::Serial2Net::broadcastMessage(c);
 #endif // !RFLINK_SERIAL2NET_DISABLED
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::broadcastMessage(c);
+#endif
     }
 
     void sendRawPrint(const __FlashStringHelper *buf, bool end_of_line){
@@ -293,6 +330,11 @@ namespace RFLink {
       if(end_of_line)
         RFLink::Serial2Net::broadcastMessage(F("\r\n"));
       #endif // !RFLINK_SERIAL2NET_DISABLED
+#if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+      RFLink::BLE::broadcastMessage(buf);
+      if(end_of_line)
+        RFLink::BLE::broadcastMessage(F("\r\n"));
+#endif
     };
 
     /**

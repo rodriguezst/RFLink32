@@ -104,6 +104,8 @@ Reference:
 | wifi    | ap_mask             | Network Mask | The AP network mask                                                                                 |
 | ser2net | enabled             | Boolean      | Use Serial2Net protocol                                                                             |
 | ser2net | port                | Number       | Set the Serial2Net port number *[default 1900]*                                                     |
+| ble     | enabled             | Boolean      | Enable the BLE serial transport *[default false]*                                                   |
+| ble     | device_name         | String       | BLE advertising name *[default RFLink32]*                                                           |
 | signal  | sample_rate         | Number       |                                                                                                     |
 | signal  | min_raw_pulses      | Number       | The minimum number of bits needed to be received before spending CPU time on decoding the signal    |
 | signal  | seek_timeout        | Number       | After this time (in milliseconds) the signal will be considered absent                              |
@@ -124,6 +126,26 @@ Reference:
 | radio   | tx_vcc              | Number       | Transmitter Power Pin                                                                               |
 | radio   | tx_nmos             | Number       | Transmitter N-MOSFET Pin                                                                            |
 | radio   | tx_pmos             | Number       | Transmitter P-MOSFET Pin                                                                            |
+
+## BLE serial transport
+
+BLE support is available on ESP32 builds compiled with `RFLINK_BLE_ENABLED`. It is disabled at runtime by default and does not use pairing or application authentication.
+
+Enable it with the CLI:
+
+```text
+10;config;set;{"ble":{"enabled":true,"device_name":"RFLink32"}}
+```
+
+The transport implements the Nordic UART Service and accepts the same newline-terminated commands as the hardware serial and Serial2Net transports.
+
+| Attribute | UUID |
+| --------- | ---- |
+| Service   | `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` |
+| RX, write or write without response | `6E400002-B5A3-F393-E0A9-E50E24DCCA9E` |
+| TX, notify | `6E400003-B5A3-F393-E0A9-E50E24DCCA9E` |
+
+Subscribe to notifications on the TX characteristic, then write commands ending in `CR`, `LF`, or `CRLF` to the RX characteristic.
 
 JSON Output:
 

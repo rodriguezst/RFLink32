@@ -14,6 +14,7 @@
 #include "12_Portal.h"
 #include "10_Wifi.h"
 #include "13_OTA.h"
+#include "14_BLE.h"
 
 #if defined(ESP8266)
 #include "ESP8266WiFi.h"
@@ -96,6 +97,9 @@ namespace RFLink { namespace Portal {
           #endif // RFLINK_MQTT_DISABLED
           RFLink::Signal::getStatusJsonString(obj);
           RFLink::Serial2Net::getStatusJsonString(obj);
+          #if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+          RFLink::BLE::getStatusJsonString(obj);
+          #endif
 
           String buffer;
           if(!buffer.reserve(512) ) {

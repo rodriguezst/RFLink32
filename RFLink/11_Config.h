@@ -29,6 +29,7 @@ namespace RFLink
             Signal_id,
             Radio_id,
             Serial2Net_id,
+            BLE_id,
             EOF_id // must always be the last!
         };
 

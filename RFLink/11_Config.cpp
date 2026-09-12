@@ -14,6 +14,7 @@
 #include "9_Serial2Net.h"
 #include "10_Wifi.h"
 #include "12_Portal.h"
+#include "14_BLE.h"
 
 #if defined(DEBUG) || defined(RFLINK_DEBUG)
 #define DEBUG_RFLINK_CONFIG
@@ -42,6 +43,7 @@ namespace RFLink
             "signal",
             "radio",
             "serial2net",
+            "ble",
             "root" // this is always the last one and matches index SectionId::EOF_id
     };
 
@@ -62,6 +64,9 @@ namespace RFLink
 #endif
             &RFLink::Signal::configItems[0],
             &RFLink::Radio::configItems[0],
+      #if defined(RFLINK_BLE_ENABLED) && defined(ESP32)
+            &RFLink::BLE::configItems[0],
+      #endif
     };
 #define configItemListsSize (sizeof(configItemLists) / sizeof(ConfigItem *))
 
