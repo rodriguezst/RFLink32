@@ -24,8 +24,11 @@ U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(/* reset=*/U8X8_PIN_NONE, /* clock=*/PIN_
 
 #define U8LOG_WIDTH 16
 #define U8LOG_HEIGHT 8
+#define OLED_TIMEOUT_MS 30000UL
 uint8_t u8log_buffer[U8LOG_WIDTH * U8LOG_HEIGHT];
 U8X8LOG u8x8log;
+static uint32_t lastOLEDUpdate = 0;
+static bool oledActive = false;
 
 void setup_OLED()
 {
@@ -52,6 +55,8 @@ void splash_OLED()
     u8x8.drawString(0, 5, buildName);
     u8x8.drawString(0, 6, __DATE__);
     u8x8.setPowerSave(0);
+    lastOLEDUpdate = millis();
+    oledActive = true;
 }
 
 void print_OLED()
@@ -76,9 +81,21 @@ void print_OLED()
         ptr = strtok(NULL, delim);
     }
 */
+    u8x8.setPowerSave(0);
     u8x8log.print('\f');
     replacechar(pbuffer, ';', '\n');
     u8x8log.print(pbuffer);
+    lastOLEDUpdate = millis();
+    oledActive = true;
+}
+
+void handle_OLED()
+{
+    if (oledActive && static_cast<uint32_t>(millis() - lastOLEDUpdate) >= OLED_TIMEOUT_MS)
+    {
+        u8x8.setPowerSave(1);
+        oledActive = false;
+    }
 }
 
 #endif // OLED_ENABLED

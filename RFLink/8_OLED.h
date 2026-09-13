@@ -26,6 +26,7 @@
 void setup_OLED();
 void splash_OLED();
 void print_OLED();
+void handle_OLED();
 
 #endif // OLED_ENABLED
 #endif // OLED_h

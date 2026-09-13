@@ -187,6 +187,9 @@ namespace RFLink {
 
       Radio::mainLoop();
       OTA::mainLoop();
+#if defined(OLED_ENABLED)
+      handle_OLED();
+#endif
     }
 
     void sendMsgFromBuffer() {
