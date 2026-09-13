@@ -6,6 +6,8 @@
 #include "RFLink.h"
 
 #include <NimBLEDevice.h>
+#include <atomic>
+#include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
@@ -19,15 +21,25 @@ namespace RFLink {
       constexpr size_t defaultNotificationSize = 20;
       constexpr TickType_t notificationChunkDelay = pdMS_TO_TICKS(10);
       constexpr size_t rxQueueSize = INPUT_COMMAND_SIZE + 64;
+      constexpr int maxBonds = CONFIG_BT_NIMBLE_MAX_BONDS;
 
-      NimBLEServer *server = nullptr;
+      static_assert(maxBonds > 0, "BLE UART requires persistent bonds");
+      static_assert(MYNEWT_VAL(BLE_STORE_MAX_BONDS) == maxBonds,
+                    "NimBLE bond capacity must match CONFIG_BT_NIMBLE_MAX_BONDS");
+      static_assert(MYNEWT_VAL(BLE_STORE_CONFIG_PERSIST), "BLE bonds must persist in NVS");
+      static_assert(CONFIG_BT_NIMBLE_MAX_CONNECTIONS == 1, "BLE UART supports one active client");
+      static_assert(MYNEWT_VAL(BLE_STORE_MAX_CCCDS) >= 2 * maxBonds, "Reserve subscriptions for all bonds");
+
       NimBLECharacteristic *txCharacteristic = nullptr;
       QueueHandle_t rxQueue = nullptr;
 
       bool running = false;
-      volatile bool connected = false;
-      volatile bool restartAdvertisingRequested = false;
-      volatile bool resetConnectionStateRequested = false;
+      std::atomic<bool> connected{false};
+      std::atomic<bool> authenticated{false};
+      std::atomic<bool> restartAdvertisingRequested{false};
+      std::atomic<bool> resetConnectionStateRequested{false};
+      std::atomic<uint16_t> connectionHandle{BLE_HS_CONN_HANDLE_NONE};
+      std::atomic<uint32_t> connectionGeneration{0};
       unsigned long droppedRxBytes = 0;
 
       char commandBuffer[INPUT_COMMAND_SIZE];
@@ -40,23 +52,67 @@ namespace RFLink {
         discardUntilNewline = false;
       }
 
+      void paramsUpdatedCallback() {
+        Serial.println(F("BLE settings saved; reboot required to apply"));
+      }
+
       class ServerCallbacks : public NimBLEServerCallbacks {
-        void onConnect(NimBLEServer *connectedServer) override {
-          (void) connectedServer;
+        void onConnect(NimBLEServer *connectedServer, NimBLEConnInfo &connInfo) override {
+          authenticated = false;
+          connectionHandle = connInfo.getConnHandle();
+          connectionGeneration++;
           connected = true;
           restartAdvertisingRequested = false;
+          if (!NimBLEDevice::startSecurity(connInfo.getConnHandle()))
+            connectedServer->disconnect(connInfo.getConnHandle());
         }
 
-        void onDisconnect(NimBLEServer *disconnectedServer) override {
+        void onDisconnect(NimBLEServer *disconnectedServer, NimBLEConnInfo &connInfo, int reason) override {
           (void) disconnectedServer;
+          (void) connInfo;
+          (void) reason;
+          authenticated = false;
           connected = false;
-          restartAdvertisingRequested = true;
+          connectionHandle = BLE_HS_CONN_HANDLE_NONE;
+          connectionGeneration++;
           resetConnectionStateRequested = true;
+          restartAdvertisingRequested = true;
+          Serial.printf("BLE UART disconnected; bonds %d/%d\r\n", NimBLEDevice::getNumBonds(), maxBonds);
+        }
+
+        uint32_t onPassKeyDisplay() override {
+          authenticated = false;
+          const uint32_t passkey = esp_random() % 1000000;
+          // Use USB/hardware Serial directly: sendRawPrint also broadcasts to
+          // BLE, TCP and potentially OLED, and must never carry this PIN.
+          Serial.printf("BLE pairing PIN: %06lu\r\n", static_cast<unsigned long>(passkey));
+          return passkey;
+        }
+
+        void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
+          authenticated = connInfo.isEncrypted() && connInfo.isAuthenticated() &&
+                          connInfo.isBonded() && connInfo.getSecKeySize() == 16;
+          if (!authenticated) {
+            Serial.println(F("BLE authentication failed; UART access denied"));
+            NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle());
+          } else {
+            Serial.println(F("BLE UART authenticated"));
+          }
+        }
+
+        void onConfirmPassKey(NimBLEConnInfo &connInfo, uint32_t pin) override {
+          (void) pin;
+          // Display-only passkey entry, never unattended confirmation.
+          NimBLEDevice::injectConfirmPasskey(connInfo, false);
         }
       };
 
       class RxCallbacks : public NimBLECharacteristicCallbacks {
-        void onWrite(NimBLECharacteristic *characteristic) override {
+        void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
+          if (!authenticated || connInfo.getConnHandle() != connectionHandle ||
+              !connInfo.isEncrypted() || !connInfo.isAuthenticated() || !connInfo.isBonded())
+            return;
+
           std::string value = characteristic->getValue();
 
           for (char byte : value) {
@@ -70,10 +126,14 @@ namespace RFLink {
       RxCallbacks rxCallbacks;
 
       void notifyBytes(const uint8_t *data, size_t length) {
-        if (!running || !connected || txCharacteristic == nullptr)
+        if (!running || !connected || !authenticated || txCharacteristic == nullptr)
           return;
 
+        const uint32_t generation = connectionGeneration;
         while (length > 0) {
+          if (!authenticated || generation != connectionGeneration)
+            return;
+
           size_t chunkSize = length;
           if (chunkSize > defaultNotificationSize)
             chunkSize = defaultNotificationSize;
@@ -124,11 +184,6 @@ namespace RFLink {
       }
     }
 
-    namespace params {
-      bool enabled = false;
-      String deviceName(F("RFLink32"));
-    }
-
     const char jsonNameEnabled[] = "enabled";
     const char jsonNameDeviceName[] = "device_name";
 
@@ -137,75 +192,37 @@ namespace RFLink {
             Config::ConfigItem(jsonNameDeviceName, Config::SectionId::BLE_id, "RFLink32", paramsUpdatedCallback),
             Config::ConfigItem()};
 
-    void setup() {
-      if (rxQueue == nullptr)
-        rxQueue = xQueueCreate(rxQueueSize, sizeof(char));
-
-      resetCommandBuffer();
-      refreshParametersFromConfig(false);
-
-      if (params::enabled)
-        start();
-    }
-
     void mainLoop() {
       if (!running)
         return;
 
-      if (resetConnectionStateRequested) {
-        resetConnectionStateRequested = false;
+      if (resetConnectionStateRequested.exchange(false)) {
         resetCommandBuffer();
         if (rxQueue != nullptr)
           xQueueReset(rxQueue);
       }
 
-      if (restartAdvertisingRequested && !connected) {
-        restartAdvertisingRequested = false;
+      if (!connected && !resetConnectionStateRequested && restartAdvertisingRequested.exchange(false)) {
         NimBLEDevice::startAdvertising();
       }
 
       char byte;
-      while (rxQueue != nullptr && xQueueReceive(rxQueue, &byte, 0) == pdTRUE)
+      while (authenticated && !resetConnectionStateRequested && rxQueue != nullptr &&
+             xQueueReceive(rxQueue, &byte, 0) == pdTRUE)
         processReceivedByte(byte);
     }
 
-    void paramsUpdatedCallback() {
-      refreshParametersFromConfig();
-    }
-
-    void refreshParametersFromConfig(bool triggerChanges) {
-      Config::ConfigItem *item;
-      bool enabledChanged = false;
-      bool deviceNameChanged = false;
-
-      item = Config::findConfigItem(jsonNameEnabled, Config::SectionId::BLE_id);
-      if (item != nullptr && item->getBoolValue() != params::enabled) {
-        params::enabled = item->getBoolValue();
-        enabledChanged = true;
-      }
-
-      item = Config::findConfigItem(jsonNameDeviceName, Config::SectionId::BLE_id);
-      if (item != nullptr && params::deviceName != item->getCharValue()) {
-        params::deviceName = item->getCharValue();
-        deviceNameChanged = true;
-      }
-
-      if (!triggerChanges)
-        return;
-
-      if (enabledChanged) {
-        if (params::enabled)
-          start();
-        else
-          stop();
-      } else if (deviceNameChanged && params::enabled) {
-        restart();
-      }
-    }
-
-    void start() {
+    void setup() {
       if (running)
         return;
+
+      // Configuration is read only at boot; edits take effect after reboot.
+      Config::ConfigItem *enabled = Config::findConfigItem(jsonNameEnabled, Config::SectionId::BLE_id);
+      if (enabled == nullptr || !enabled->getBoolValue()) {
+        Serial.println(F("BLE UART service disabled"));
+        return;
+      }
+      Config::ConfigItem *deviceName = Config::findConfigItem(jsonNameDeviceName, Config::SectionId::BLE_id);
 
       if (rxQueue == nullptr)
         rxQueue = xQueueCreate(rxQueueSize, sizeof(char));
@@ -215,61 +232,45 @@ namespace RFLink {
         return;
       }
 
-          NimBLEDevice::init(params::deviceName.c_str());
-          server = NimBLEDevice::createServer();
-      server->setCallbacks(&serverCallbacks);
+      resetCommandBuffer();
+      const char *name = deviceName != nullptr ? deviceName->getCharValue() : "RFLink32";
+      if (!NimBLEDevice::init(name)) {
+        Serial.println(F("Failed to initialize BLE"));
+        return;
+      }
+      NimBLEDevice::setSecurityAuth(true, true, true); // Bonding, MITM, Secure Connections.
+      NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+      // Keep NimBLE's default key distribution, NVS storage and oldest-bond eviction.
+      NimBLEServer *server = NimBLEDevice::createServer();
+      server->setCallbacks(&serverCallbacks, false);
+      // Reset the previous client's command state in mainLoop before advertising.
+      server->advertiseOnDisconnect(false);
 
-          NimBLEService *service = server->createService(serviceUuid);
+      NimBLEService *service = server->createService(serviceUuid);
 
       txCharacteristic = service->createCharacteristic(
               txCharacteristicUuid,
-              NIMBLE_PROPERTY::NOTIFY);
+              NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN);
 
-          NimBLECharacteristic *rxCharacteristic = service->createCharacteristic(
+      NimBLECharacteristic *rxCharacteristic = service->createCharacteristic(
               rxCharacteristicUuid,
-              NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+              NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR |
+              NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
       rxCharacteristic->setCallbacks(&rxCallbacks);
 
-      service->start();
-
+      // NimBLE 2.x starts the GATT server, including all services, when advertising starts.
       NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
       advertising->addServiceUUID(serviceUuid);
-      advertising->setScanResponse(true);
-      advertising->setMinPreferred(0x06);
-      advertising->setMaxPreferred(0x12);
+      advertising->enableScanResponse(true);
+      advertising->setName(name);
+      advertising->setPreferredParams(0x06, 0x12);
 
-      connected = false;
-      restartAdvertisingRequested = false;
-      resetConnectionStateRequested = false;
-      running = true;
-      NimBLEDevice::startAdvertising();
-      Serial.println(F("BLE UART service started"));
-    }
-
-    void stop() {
-      if (!running)
+      running = NimBLEDevice::startAdvertising();
+      if (!running) {
+        Serial.println(F("Failed to start BLE advertising"));
         return;
-
-      NimBLEDevice::stopAdvertising();
-      NimBLEDevice::deinit(true);
-
-      server = nullptr;
-      txCharacteristic = nullptr;
-      connected = false;
-      restartAdvertisingRequested = false;
-      resetConnectionStateRequested = false;
-      running = false;
-      resetCommandBuffer();
-
-      if (rxQueue != nullptr)
-        xQueueReset(rxQueue);
-
-      Serial.println(F("BLE UART service stopped"));
-    }
-
-    void restart() {
-      stop();
-      start();
+      }
+      Serial.printf("BLE UART service started; bonds %d/%d\r\n", NimBLEDevice::getNumBonds(), maxBonds);
     }
 
     void broadcastMessage(const char *message) {
@@ -294,7 +295,7 @@ namespace RFLink {
     void getStatusJsonString(JsonObject &output) {
       JsonObject status = output.createNestedObject(F("ble"));
       status[F("status")] = running ? F("running") : F("disabled");
-      status[F("connected")] = connected;
+      status[F("connected")] = connected.load();
       status[F("rx_dropped_bytes")] = droppedRxBytes;
     }
 
