@@ -19,6 +19,8 @@ namespace RFLink {
       constexpr char rxCharacteristicUuid[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
       constexpr char txCharacteristicUuid[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
       constexpr size_t defaultNotificationSize = 20;
+      constexpr size_t notificationOverhead = 3;
+      constexpr size_t maxNotificationSize = 512;
       constexpr TickType_t notificationChunkDelay = pdMS_TO_TICKS(10);
       constexpr size_t rxQueueSize = INPUT_COMMAND_SIZE + 64;
       constexpr int maxBonds = CONFIG_BT_NIMBLE_MAX_BONDS;
@@ -41,6 +43,8 @@ namespace RFLink {
       std::atomic<uint16_t> connectionHandle{BLE_HS_CONN_HANDLE_NONE};
       std::atomic<uint32_t> connectionGeneration{0};
       unsigned long droppedRxBytes = 0;
+      unsigned long droppedTxBytes = 0;
+      unsigned long failedNotifications = 0;
 
       char commandBuffer[INPUT_COMMAND_SIZE];
       size_t commandLength = 0;
@@ -130,15 +134,37 @@ namespace RFLink {
           return;
 
         const uint32_t generation = connectionGeneration;
+        const uint16_t handle = connectionHandle;
+        if (handle == BLE_HS_CONN_HANDLE_NONE)
+          return;
+
         while (length > 0) {
-          if (!authenticated || generation != connectionGeneration)
+          if (!connected || !authenticated || generation != connectionGeneration) {
+            droppedTxBytes += length;
             return;
+          }
+
+          const uint16_t mtu = NimBLEDevice::getServer()->getPeerMTU(handle);
+          size_t payloadSize = defaultNotificationSize;
+          if (mtu > defaultNotificationSize + notificationOverhead)
+            payloadSize = mtu - notificationOverhead;
+          if (payloadSize > maxNotificationSize)
+            payloadSize = maxNotificationSize;
 
           size_t chunkSize = length;
-          if (chunkSize > defaultNotificationSize)
-            chunkSize = defaultNotificationSize;
+          if (chunkSize > payloadSize)
+            chunkSize = payloadSize;
 
-          txCharacteristic->notify(data, chunkSize);
+          if (!connected || !authenticated || generation != connectionGeneration) {
+            droppedTxBytes += length;
+            return;
+          }
+
+          if (!txCharacteristic->notify(data, chunkSize, handle)) {
+            failedNotifications++;
+            droppedTxBytes += length;
+            return;
+          }
 
           data += chunkSize;
           length -= chunkSize;
@@ -250,7 +276,8 @@ namespace RFLink {
 
       txCharacteristic = service->createCharacteristic(
               txCharacteristicUuid,
-              NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN);
+              NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN,
+              maxNotificationSize);
 
       NimBLECharacteristic *rxCharacteristic = service->createCharacteristic(
               rxCharacteristicUuid,
@@ -297,6 +324,8 @@ namespace RFLink {
       status[F("status")] = running ? F("running") : F("disabled");
       status[F("connected")] = connected.load();
       status[F("rx_dropped_bytes")] = droppedRxBytes;
+      status[F("tx_dropped_bytes")] = droppedTxBytes;
+      status[F("tx_failed_notifications")] = failedNotifications;
     }
 
   }

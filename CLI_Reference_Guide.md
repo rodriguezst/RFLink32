@@ -147,6 +147,10 @@ The transport implements the Nordic UART Service and accepts the same newline-te
 
 Subscribe to notifications on the TX characteristic, then write commands ending in `CR`, `LF`, or `CRLF` to the RX characteristic.
 
+Outgoing chunks use the current connection's negotiated ATT MTU minus 3 bytes, capped at 512 bytes. The fallback is 20 bytes when no larger MTU is available. The existing 10 ms delay between chunks is retained. Treat notifications as a byte stream: a notification boundary is not a message boundary.
+
+If NimBLE rejects a notification, the transport stops the current write without retrying or sending its remaining chunks. BLE status includes `tx_failed_notifications` (rejected send calls) and `tx_dropped_bytes` (unsent bytes abandoned after a send failure or connection/authentication change during a write). Both counters accumulate until reboot; output skipped because BLE is unavailable before a write starts is not counted. Successful send calls are not application-level delivery acknowledgements.
+
 JSON Output:
 
 ```json
