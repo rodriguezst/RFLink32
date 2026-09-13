@@ -41,15 +41,16 @@ void setup_OLED()
 
 void splash_OLED()
 {
-    char ver[7];
-    sprintf_P(ver, PSTR("v%d.%d"), BUILDNR, REVNR);
+    char version[16];
+    char buildName[U8LOG_WIDTH + 1];
+
+    snprintf_P(version, sizeof(version), PSTR("v%d.%d"), BUILDNR, REVNR);
+    snprintf_P(buildName, sizeof(buildName), PSTR("%s"), PSTR(RFLINK_BUILDNAME));
     u8x8.setFont(u8x8_font_amstrad_cpc_extended_r);
-    u8x8.draw2x2String(0, 0, "RFLink");
-    u8x8.draw2x2String(10, 2, "ESP");
-    u8x8.drawString(0, 3, ver);
-    u8x8.drawString(0, 4, "24/09/20");
-    u8x8.drawString(6, 6, "github.com");
-    u8x8.drawString(2, 7, "/couin3/RFLink");
+    u8x8.draw2x2String(0, 1, "RFLink32");
+    u8x8.drawString(0, 4, version);
+    u8x8.drawString(0, 5, buildName);
+    u8x8.drawString(0, 6, __DATE__);
     u8x8.setPowerSave(0);
 }
 
