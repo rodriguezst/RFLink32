@@ -42,3 +42,11 @@ Para localizar la pérdida, enviar unos pocos `10;PING;\n` separados y comparar 
 5. **reset/reset_bytes crecen**: la cola se limpió; correlacionar con handle, generación y desconexión. **status_notify failed** o **status_completion failed_no_peer_id**: releer estado; el fallo no convierte por sí mismo READY en falso.
 
 El capturador tiene un coste limitado, pero no es una medida exacta de tiempos de radio. Para una prueba sin su coste, usar el entorno normal o revertir el commit de debug. La validación de la app y los fallos de radio requiere hardware BLE real.
+
+## Inventario GATT al arrancar
+
+El firmware de debug imprime además **tres líneas fijas al arrancar**, una por RX, TX y estado, después de registrar los servicios y arrancar el anuncio. Este informe de arranque se imprime desde setup; no forma parte del presupuesto periódico de 128 bytes/100 ms ni se ejecuta en callbacks.
+
+Cada línea `[BLEDBG] ... gatt` consulta la tabla del stack mediante `ble_gatts_find_svc` y `ble_gatts_find_chr`. `svc_rc=0` y `chr_rc=0`, con handles no nulos, confirman que esa característica está registrada bajo ese servicio. `decl_h` es el handle de declaración y `value_h` el de valor; no son connection handles. `props` son flags internos NimBLE, incluidos los de seguridad, no el valor bruto de CBCharacteristicProperties.
+
+Si el iPhone devuelve una lista vacía para el servicio de estado, comparar ese resultado con la línea del UUID `A8F10002-8D5B-4A6D-9F32-70E4B2C6D901`. Un lookup correcto en firmware y una lista vacía en iOS acotan la investigación a descubrimiento, caché o la respuesta ATT recibida; no prueban por sí solos un fallo de caché. Véase [recuperación y diagnóstico CoreBluetooth](BLE_iOS_Discovery.md).

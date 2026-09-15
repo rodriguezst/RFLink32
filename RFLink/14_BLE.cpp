@@ -68,6 +68,21 @@ namespace RFLink {
       Diagnostics diagnostics;
       uint8_t diagnosticSecurity = 0, diagnosticKeySize = 0; // stateMux
 
+      // One fixed report at boot, after registration. Look up the live stack
+      // database rather than assuming that a C++ characteristic was registered.
+      void reportGattRegistration(NimBLEService *service, NimBLECharacteristic *characteristic) {
+        uint16_t serviceHandle = 0, declarationHandle = 0, valueHandle = 0;
+        const auto serviceId = service->getUUID();
+        const auto characteristicId = characteristic->getUUID();
+        const int serviceResult = ble_gatts_find_svc(serviceId.getBase(), &serviceHandle);
+        const int characteristicResult = ble_gatts_find_chr(serviceId.getBase(), characteristicId.getBase(),
+                                                            &declarationHandle, &valueHandle);
+        Serial.printf("[BLEDBG] t=%lu gatt svc=%s svc_rc=%d svc_h=%u chr=%s chr_rc=%d decl_h=%u value_h=%u props=0x%04x\r\n",
+                      static_cast<unsigned long>(millis()), serviceId.toString().c_str(), serviceResult, serviceHandle,
+                      characteristicId.toString().c_str(), characteristicResult, declarationHandle, valueHandle,
+                      characteristic->getProperties());
+      }
+
       uint8_t securityFlags(NimBLEConnInfo &info) {
         return info.isEncrypted() | (info.isAuthenticated() << 1) | (info.isBonded() << 2);
       }
@@ -529,6 +544,11 @@ namespace RFLink {
         Serial.println(F("Failed to start BLE advertising"));
         return;
       }
+#ifdef RFLINK_BLE_DEBUG
+      reportGattRegistration(service, rxCharacteristic);
+      reportGattRegistration(service, txCharacteristic);
+      reportGattRegistration(statusService, statusCharacteristic);
+#endif
       Serial.printf("BLE UART service started; bonds %d/%d\r\n", NimBLEDevice::getNumBonds(), maxBonds);
     }
 
