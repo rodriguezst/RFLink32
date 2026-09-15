@@ -48,3 +48,13 @@ READY no es un crédito de cola ni una confirmación por comando: otras escritur
 Pruebas de host: `g++ -std=c++11 -Wall -Wextra -Werror tests/ble_transport_state_test.cpp -o /tmp/ble_transport_test && /tmp/ble_transport_test`. Compilación ESP32: `pio run -e lilygo_lora32`.
 
 Validación con dispositivo/app: primer emparejamiento y reconexión bonded; ambos órdenes auth/TX; estado antes/después de auth; cliente sin característica de estado; desuscribir/resuscribir TX; reconectar durante un comando fragmentado; clave/seguridad insuficientes; cola saturada; pérdida de notificación y recuperación por READ; reinicio con nuevo boot_id. Al actualizar firmware, volver a descubrir servicios si el sistema mantiene una caché GATT anterior.
+
+### Caché GATT tras reiniciar o actualizar el firmware
+
+Antes de anunciarse, el firmware registra toda la tabla GATT y llama a la API estándar Service Changed de NimBLE para el rango `0x0001..0xffff`. Se hace **una vez por arranque**, de forma conservadora, porque el aviso automático de NimBLE solo cubre cambios realizados después de arrancar el servidor. Los UUID, los requisitos de seguridad y el formato del estado permanecen iguales.
+
+NimBLE conserva el aviso pendiente para los clientes bonded suscritos a Service Changed (`1801/2A05`) y lo entrega al restaurar su cifrado, bond y CCCD. No se borra ningún bond ni se fuerza una nueva vinculación. El aviso se confirma mediante una indicación ATT; no se vuelve a marcar la tabla al reconectar dentro del mismo arranque. Si se reinicia antes de entregar un aviso, la llamada de arranque también restablece el rango de handles, que NimBLE guarda en RAM.
+
+En iOS, `peripheral(_:didModifyServices:)` debe invalidar READY y las referencias GATT afectadas. Antes de escribir RF, la app puede volver a descubrir ambos servicios dentro del plazo original; después de empezar a escribir, debe terminar con resultado incierto, sin reintento. Cancelar el intento también es seguro, pero puede requerir que el usuario lo repita una vez después de reiniciar el puente. Véase el [ejemplo de recuperación CoreBluetooth](BLE_iOS_Discovery.md#recover-service-changed-before-sending).
+
+Service Changed solo puede invalidar por esta vía a clientes que tengan registrada la suscripción estándar. Si el resultado sigue vacío, comprobar el inventario GATT de arranque y la recepción de la indicación/`didModifyServices`; no dar por demostrada una caché defectuosa ni sustituir el protocolo READY por PING. En hardware, verificar actualización con bond existente, reinicio con indicación pendiente, y dos conexiones consecutivas sin reiniciar: la segunda no debe producir un nuevo aviso provocado por el firmware si el primero ya fue confirmado.

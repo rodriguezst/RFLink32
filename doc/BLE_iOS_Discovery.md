@@ -68,3 +68,67 @@ Continue logging the entire `service.characteristics` inventory before selecting
 - An ATT capture distinguishes a response actually missing declarations from a CoreBluetooth result served from cache. Reconnecting or calling `discoverServices` again does not guarantee cache invalidation. Do not change stable protocol UUIDs or remove security just to force a cache miss.
 
 This patch addresses premature termination and improves diagnosis. It does not identify or fix the underlying cause of an empty result without those additional observations. Swift/CoreBluetooth behavior requires validation on iOS; this firmware workspace does not contain the app project.
+
+## Recover Service Changed before sending
+
+A paired trace can show both UART and status subscriptions restored immediately after authentication even when this app never discovered the status characteristic. NimBLE restores CCCDs from the bond; these events do not prove that the app issued fresh subscription writes. `status_notify ... detail=0` means the firmware attempted to send READY. `write=0` means no RX callback was entered. Disconnect reason `531` is NimBLE's `0x200 + 0x13`, HCI Remote User Terminated Connection, consistent with the app cancelling the connection.
+
+The firmware now marks the complete GATT database changed **once per boot**, before advertising. NimBLE persists the standard Service Changed indication for bonded subscribers and delivers it on bond restoration. This repairs the missing firmware invalidation path across boots/updates; it is not proof that every empty discovery has that cause. A client which never subscribed to the standard Service Changed characteristic cannot receive this indication.
+
+The supplied app currently calls `finish` in `didModifyServices`. With invalidation enabled, it may therefore cancel the first attempt after a bridge reboot. Either allow the user to start a new attempt, or recover automatically before RF writes using the following replacement. This is in addition to the bounded missing-characteristic retry above, not an invitation to keep retrying empty results.
+
+Add an operation-wide counter and reset it at the start of `run(...)`, **not** in `retryBeforeWrite`:
+
+```swift
+private var serviceChangeRecoveries = 0
+// At the beginning of run(...):
+// serviceChangeRecoveries = 0
+```
+
+Replace the supplied `didModifyServices` handler with:
+
+```swift
+func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+    guard self.peripheral === peripheral, proceed(),
+          invalidatedServices.contains(where: {
+              $0.uuid == Self.service || $0.uuid == Self.statusService
+          }) else { return }
+
+    gate.updateFirmwareReady(false)
+    if gate.writeStarted {
+        finish(.uncertain, "GATT changed after RF bytes were handed off. No automatic retry.")
+        return
+    }
+    guard peripheral.state == .connected, serviceChangeRecoveries < 2 else {
+        finish(.unavailable, "GATT invalidation recovery unavailable or exhausted. RF command was not sent.")
+        return
+    }
+    serviceChangeRecoveries += 1
+
+    retryTask?.cancel()
+    pingTask?.cancel()
+    statusPollTask?.cancel()
+    cancelDiscoveryRetries()
+    rx = nil
+    uartService = nil
+    readinessService = nil
+    responseCharacteristic = nil
+    statusCharacteristic = nil
+    subscribed = false
+    servicesResolved = false
+    statusMonitoringStarted = false
+    lastStatusIssue = "GATT invalidated; rediscovering services"
+    lastStatusReadAt = nil
+    chunks = nil
+    gate.resetConnection() // Must preserve the existing operation deadline.
+    statusTracker = FirmwareStatusTracker()
+    decoder = RFLineDecoder()
+
+    log("Service Changed received; discarding GATT references and rediscovering on the current connection (\(serviceChangeRecoveries)/2)")
+    peripheral.discoverServices([Self.service, Self.statusService])
+}
+```
+
+Keep the existing callback checks against the current service and characteristic objects. Until rediscovery, UART subscription and a fresh READY succeed, no command should pass the transmission gate. Do not call the existing `retryBeforeWrite` directly while still connected: it attempts another `central.connect`, rather than rediscovering on the current connection.
+
+This example uses the supplied class and its existing `TransmissionGate.resetConnection()` contract. It must be integrated and tested in the iOS app; the firmware repository does not contain that type or a CoreBluetooth test target.

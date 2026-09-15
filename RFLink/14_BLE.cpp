@@ -528,7 +528,20 @@ namespace RFLink {
               NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN, 17);
       statusCharacteristic->setCallbacks(&subscriptionCallbacks);
 
-      // NimBLE 2.x starts the GATT server, including all services, when advertising starts.
+      // Register the complete database before marking it changed. NimBLE only
+      // auto-announces changes made after its server was already started; a
+      // firmware upgrade/cold boot otherwise leaves bonded clients' caches stale.
+      if (!server->start()) {
+        Serial.println(F("Failed to register BLE GATT database"));
+        return;
+      }
+      // Conservatively invalidate once per boot, never on each connection.
+      // This also initializes NimBLE's volatile changed-handle range (1..ffff)
+      // for pending indications surviving a reboot. With advertising stopped,
+      // NimBLE persists the update for bonded Service Changed subscribers and
+      // delivers it when their encryption/bond and CCCD state are restored.
+      server->sendServiceChangedIndication();
+
       NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
       advertising->addServiceUUID(serviceUuid);
       advertising->enableScanResponse(true);
