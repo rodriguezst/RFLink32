@@ -40,6 +40,7 @@ namespace RFLink {
       std::atomic<bool> authenticated{false};
       std::atomic<bool> restartAdvertisingRequested{false};
       std::atomic<bool> resetConnectionStateRequested{false};
+      std::atomic<bool> rxOverflow{false};
       std::atomic<uint16_t> connectionHandle{BLE_HS_CONN_HANDLE_NONE};
       std::atomic<uint32_t> connectionGeneration{0};
       unsigned long droppedRxBytes = 0;
@@ -130,10 +131,18 @@ namespace RFLink {
 
           std::string value = characteristic->getValue();
 
-          for (char byte : value) {
-            if (rxQueue == nullptr || xQueueSend(rxQueue, &byte, 0) != pdTRUE)
-              droppedRxBytes++;
+          // The NimBLE host is the only producer; the consumer can only free
+          // space. Reserve enough room for the whole write before adding bytes.
+          if (rxOverflow || rxQueue == nullptr || value.size() > uxQueueSpacesAvailable(rxQueue)) {
+            droppedRxBytes += value.size();
+            // A missing fragment invalidates the stream until disconnect cleanup.
+            if (!rxOverflow.exchange(true))
+              NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle());
+            return;
           }
+
+          for (char byte : value)
+            xQueueSend(rxQueue, &byte, 0);
         }
       };
 
@@ -186,6 +195,11 @@ namespace RFLink {
       }
 
       void executeCommand() {
+        // Overflow may have occurred after mainLoop dequeued the newline.
+        if (rxOverflow) {
+          resetCommandBuffer();
+          return;
+        }
         commandBuffer[commandLength] = 0;
         RFLink::sendRawPrint(F("\33[2K\r"));
         RFLink::sendRawPrint(F("Message arrived [BLE]:"));
@@ -237,6 +251,7 @@ namespace RFLink {
         resetCommandBuffer();
         if (rxQueue != nullptr)
           xQueueReset(rxQueue);
+        rxOverflow = false;
       }
 
       if (!connected && !resetConnectionStateRequested && restartAdvertisingRequested.exchange(false)) {
@@ -244,7 +259,7 @@ namespace RFLink {
       }
 
       char byte;
-      while (authenticated && !resetConnectionStateRequested && rxQueue != nullptr &&
+      while (authenticated && !rxOverflow && !resetConnectionStateRequested && rxQueue != nullptr &&
              xQueueReceive(rxQueue, &byte, 0) == pdTRUE)
         processReceivedByte(byte);
     }
