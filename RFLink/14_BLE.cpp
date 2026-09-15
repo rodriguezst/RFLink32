@@ -4,12 +4,17 @@
 
 #include "3_Serial.h"
 #include "RFLink.h"
+#include "BLETransportState.h"
 
 #include <NimBLEDevice.h>
 #include <atomic>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
+#ifdef USING_NIMBLE_ARDUINO_HEADERS
+#include "nimble/porting/nimble/include/nimble/nimble_port.h"
+#else
+#include "nimble/nimble_port.h"
+#endif
 
 namespace RFLink {
   namespace BLE {
@@ -18,6 +23,8 @@ namespace RFLink {
       constexpr char serviceUuid[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
       constexpr char rxCharacteristicUuid[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
       constexpr char txCharacteristicUuid[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+      constexpr char statusServiceUuid[] = "A8F10001-8D5B-4A6D-9F32-70E4B2C6D901";
+      constexpr char statusCharacteristicUuid[] = "A8F10002-8D5B-4A6D-9F32-70E4B2C6D901";
       constexpr size_t defaultNotificationSize = 20;
       constexpr size_t notificationOverhead = 3;
       constexpr size_t maxNotificationSize = 512;
@@ -30,21 +37,31 @@ namespace RFLink {
                     "NimBLE bond capacity must match CONFIG_BT_NIMBLE_MAX_BONDS");
       static_assert(MYNEWT_VAL(BLE_STORE_CONFIG_PERSIST), "BLE bonds must persist in NVS");
       static_assert(CONFIG_BT_NIMBLE_MAX_CONNECTIONS == 1, "BLE UART supports one active client");
-      static_assert(MYNEWT_VAL(BLE_STORE_MAX_CCCDS) >= 2 * maxBonds, "Reserve subscriptions for all bonds");
+      static_assert(MYNEWT_VAL(BLE_STORE_MAX_CCCDS) >= 3 * maxBonds, "Reserve UART, status and Service Changed subscriptions for all bonds");
 
+      static_assert(INPUT_COMMAND_SIZE > 1 && INPUT_COMMAND_SIZE <= 65536, "Status command limit is uint16");
       NimBLECharacteristic *txCharacteristic = nullptr;
-      QueueHandle_t rxQueue = nullptr;
-
+      NimBLECharacteristic *statusCharacteristic = nullptr;
+      using State = TransportState<rxQueueSize>;
+      State transport;
+      // Only bounded memory operations under this lock; never Serial, BLE or the CLI.
+      portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+      struct StateLock {
+        StateLock() { portENTER_CRITICAL(&stateMux); }
+        ~StateLock() { portEXIT_CRITICAL(&stateMux); }
+      };
+      uint64_t bootId = 0;
+      ble_npl_event statusEvent;
+      std::atomic<bool> statusEventPending{false};
+      uint32_t nextStatusAttempt = 0; // Protected by stateMux.
       bool running = false;
-      std::atomic<bool> connected{false};
-      std::atomic<bool> authenticated{false};
       std::atomic<bool> restartAdvertisingRequested{false};
-      std::atomic<bool> resetConnectionStateRequested{false};
-      std::atomic<uint16_t> connectionHandle{BLE_HS_CONN_HANDLE_NONE};
-      std::atomic<uint32_t> connectionGeneration{0};
-      unsigned long droppedRxBytes = 0;
-      unsigned long droppedTxBytes = 0;
-      unsigned long failedNotifications = 0;
+      std::atomic<uint32_t> pendingPasskey{UINT32_MAX};
+      std::atomic<unsigned long> droppedRxBytes{0};
+      std::atomic<unsigned long> droppedTxBytes{0};
+      std::atomic<unsigned long> failedNotifications{0};
+      std::atomic<unsigned long> failedStatusNotifications{0};
+      uint32_t parserGeneration = 0; // Command consumer only.
 
       char commandBuffer[INPUT_COMMAND_SIZE];
       size_t commandLength = 0;
@@ -60,86 +77,147 @@ namespace RFLink {
         Serial.println(F("BLE settings saved; reboot required to apply"));
       }
 
+      bool meetsSecurity(NimBLEConnInfo &info) {
+        return info.isEncrypted() && info.isAuthenticated() && info.isBonded() && info.getSecKeySize() == 16;
+      }
+
+      // Runs on the NimBLE host, serialized with connection/security callbacks.
+      // Explicit payloads avoid sharing the READ value with the command task.
+      void sendStatusEvent(ble_npl_event *) {
+        uint8_t value[17];
+        uint16_t handle;
+        bool send, overflow;
+        {
+          StateLock lock;
+          handle = transport.handle;
+          overflow = transport.overflow && handle != State::noHandle;
+          send = transport.dirty && transport.secure && transport.statusSubscribed && handle != State::noHandle;
+          transport.encode(bootId, INPUT_COMMAND_SIZE - 1, value);
+          if (send) {
+            transport.dirty = false;
+            nextStatusAttempt = 0;
+          }
+        }
+        if (send && !statusCharacteristic->notify(value, sizeof(value), handle)) {
+          failedStatusNotifications++;
+          StateLock lock;
+          transport.dirty = true;
+          nextStatusAttempt = millis() + 250;
+        }
+        // Lost command fragments cannot be recovered safely in this session.
+        if (overflow) NimBLEDevice::getServer()->disconnect(handle);
+        statusEventPending = false;
+      }
+
       class ServerCallbacks : public NimBLEServerCallbacks {
-        void onConnect(NimBLEServer *connectedServer, NimBLEConnInfo &connInfo) override {
-          authenticated = false;
-          connectionHandle = connInfo.getConnHandle();
-          connectionGeneration++;
-          connected = true;
+        void onConnect(NimBLEServer *server, NimBLEConnInfo &info) override {
+          {
+            StateLock lock;
+            transport.connect(info.getConnHandle());
+            nextStatusAttempt = 0;
+          }
           restartAdvertisingRequested = false;
-          if (!NimBLEDevice::startSecurity(connInfo.getConnHandle()))
-            connectedServer->disconnect(connInfo.getConnHandle());
+          if (!NimBLEDevice::startSecurity(info.getConnHandle()))
+            server->disconnect(info.getConnHandle());
         }
 
-        void onDisconnect(NimBLEServer *disconnectedServer, NimBLEConnInfo &connInfo, int reason) override {
-          (void) disconnectedServer;
-          (void) connInfo;
+        void onDisconnect(NimBLEServer *, NimBLEConnInfo &info, int reason) override {
           (void) reason;
-          authenticated = false;
-          connected = false;
-          connectionHandle = BLE_HS_CONN_HANDLE_NONE;
-          connectionGeneration++;
-          resetConnectionStateRequested = true;
+          {
+            StateLock lock;
+            if (!transport.disconnect(info.getConnHandle())) return;
+          }
+          pendingPasskey = UINT32_MAX;
           restartAdvertisingRequested = true;
-          Serial.printf("BLE UART disconnected; bonds %d/%d\r\n", NimBLEDevice::getNumBonds(), maxBonds);
         }
 
         uint32_t onPassKeyDisplay() override {
-          authenticated = false;
           const uint32_t passkey = esp_random() % 1000000;
-          // Use USB/hardware Serial directly: sendRawPrint also broadcasts to
-          // BLE, TCP and potentially OLED, and must never carry this PIN.
-          Serial.printf("BLE pairing PIN: %06lu\r\n", static_cast<unsigned long>(passkey));
+          // No peer identity in this callback: never mutate connection state here.
+          // USB-only printing is deferred to the consumer; never broadcast the PIN.
+          pendingPasskey = passkey;
           return passkey;
         }
 
-        void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
-          authenticated = connInfo.isEncrypted() && connInfo.isAuthenticated() &&
-                          connInfo.isBonded() && connInfo.getSecKeySize() == 16;
-          if (!authenticated) {
-            Serial.println(F("BLE authentication failed; UART access denied"));
-            NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle());
-          } else {
-            Serial.println(F("BLE UART authenticated"));
+        void onAuthenticationComplete(NimBLEConnInfo &info) override {
+          const bool secure = meetsSecurity(info);
+          {
+            StateLock lock;
+            if (!transport.authenticate(info.getConnHandle(), secure)) return;
           }
+          if (!secure) NimBLEDevice::getServer()->disconnect(info.getConnHandle());
         }
 
-        void onConfirmPassKey(NimBLEConnInfo &connInfo, uint32_t pin) override {
+        void onConfirmPassKey(NimBLEConnInfo &info, uint32_t pin) override {
           (void) pin;
           // Display-only passkey entry, never unattended confirmation.
-          NimBLEDevice::injectConfirmPasskey(connInfo, false);
+          NimBLEDevice::injectConfirmPasskey(info, false);
         }
       };
 
       class RxCallbacks : public NimBLECharacteristicCallbacks {
-        void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &connInfo) override {
-          if (!authenticated || connInfo.getConnHandle() != connectionHandle ||
-              !connInfo.isEncrypted() || !connInfo.isAuthenticated() || !connInfo.isBonded())
-            return;
+        void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &info) override {
+          const auto &value = characteristic->getValue();
+          StateLock lock;
+          const auto result = transport.write(info.getConnHandle(), meetsSecurity(info),
+                                               reinterpret_cast<const char *>(value.data()), value.size());
+          if (result != State::WriteResult::Accepted) droppedRxBytes += value.size();
+        }
+      };
 
-          std::string value = characteristic->getValue();
-
-          for (char byte : value) {
-            if (rxQueue == nullptr || xQueueSend(rxQueue, &byte, 0) != pdTRUE)
-              droppedRxBytes++;
+      class SubscriptionCallbacks : public NimBLECharacteristicCallbacks {
+        void onStatus(NimBLECharacteristic *characteristic, int code) override {
+          if (characteristic != statusCharacteristic || code == 0) return;
+          failedStatusNotifications++;
+          StateLock lock;
+          // This callback has no peer identity. Request a fresh snapshot only;
+          // never change readiness or security based on an old completion.
+          transport.dirty = true;
+          nextStatusAttempt = millis() + 250;
+        }
+        void onSubscribe(NimBLECharacteristic *characteristic, NimBLEConnInfo &info, uint16_t value) override {
+          StateLock lock;
+          transport.subscribe(info.getConnHandle(), characteristic == statusCharacteristic, (value & 1) != 0);
+        }
+        void onRead(NimBLECharacteristic *characteristic, NimBLEConnInfo &info) override {
+          if (characteristic != statusCharacteristic) return;
+          uint8_t value[17];
+          bool allowed;
+          {
+            StateLock lock;
+            allowed = transport.matches(info.getConnHandle()) && meetsSecurity(info);
+            transport.encode(bootId, INPUT_COMMAND_SIZE - 1, value);
           }
+          // ATT enforces READ_ENC/READ_AUTHEN; also withhold the value if
+          // bonding/key size do not meet the command transport policy.
+          characteristic->setValue(value, allowed ? sizeof(value) : 0);
         }
       };
 
       ServerCallbacks serverCallbacks;
       RxCallbacks rxCallbacks;
+      SubscriptionCallbacks subscriptionCallbacks;
+
+      bool canSend(uint32_t generation, uint16_t handle) {
+        StateLock lock;
+        return transport.matches(handle) && transport.generation == generation &&
+               (transport.reason() == State::Reason::Ready || transport.reason() == State::Reason::QueueFull);
+      }
 
       void notifyBytes(const uint8_t *data, size_t length) {
-        if (!running || !connected || !authenticated || txCharacteristic == nullptr)
+        if (!running || txCharacteristic == nullptr)
           return;
 
-        const uint32_t generation = connectionGeneration;
-        const uint16_t handle = connectionHandle;
-        if (handle == BLE_HS_CONN_HANDLE_NONE)
-          return;
+        uint32_t generation;
+        uint16_t handle;
+        {
+          StateLock lock;
+          generation = transport.generation;
+          handle = transport.handle;
+        }
 
         while (length > 0) {
-          if (!connected || !authenticated || generation != connectionGeneration) {
+          if (!canSend(generation, handle)) {
             droppedTxBytes += length;
             return;
           }
@@ -155,7 +233,7 @@ namespace RFLink {
           if (chunkSize > payloadSize)
             chunkSize = payloadSize;
 
-          if (!connected || !authenticated || generation != connectionGeneration) {
+          if (!canSend(generation, handle)) {
             droppedTxBytes += length;
             return;
           }
@@ -175,6 +253,14 @@ namespace RFLink {
       }
 
       void executeCommand() {
+        {
+          StateLock lock;
+          if (parserGeneration != transport.generation ||
+              (transport.reason() != State::Reason::Ready && transport.reason() != State::Reason::QueueFull)) {
+            resetCommandBuffer();
+            return;
+          }
+        }
         commandBuffer[commandLength] = 0;
         RFLink::sendRawPrint(F("\33[2K\r"));
         RFLink::sendRawPrint(F("Message arrived [BLE]:"));
@@ -222,20 +308,38 @@ namespace RFLink {
       if (!running)
         return;
 
-      if (resetConnectionStateRequested.exchange(false)) {
-        resetCommandBuffer();
-        if (rxQueue != nullptr)
-          xQueueReset(rxQueue);
+      const uint32_t passkey = pendingPasskey.exchange(UINT32_MAX);
+      if (passkey != UINT32_MAX)
+        Serial.printf("BLE pairing PIN: %06lu\r\n", static_cast<unsigned long>(passkey));
+
+      bool advertise, notifyStatus;
+      {
+        StateLock lock;
+        if (transport.cleanup && (!transport.overflow || transport.handle == State::noHandle)) {
+          resetCommandBuffer();
+          droppedRxBytes += transport.clean();
+          parserGeneration = transport.generation;
+        }
+        transport.publishReady(); // Only the initialized consumer may publish READY.
+        advertise = transport.handle == State::noHandle;
+        notifyStatus = transport.overflow || (transport.dirty && transport.secure && transport.statusSubscribed &&
+                       (nextStatusAttempt == 0 || static_cast<int32_t>(millis() - nextStatusAttempt) >= 0));
       }
 
-      if (!connected && !resetConnectionStateRequested && restartAdvertisingRequested.exchange(false)) {
+      if (advertise && restartAdvertisingRequested.exchange(false))
         NimBLEDevice::startAdvertising();
-      }
+      if (notifyStatus && !statusEventPending.exchange(true))
+        ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &statusEvent);
 
       char byte;
-      while (authenticated && !resetConnectionStateRequested && rxQueue != nullptr &&
-             xQueueReceive(rxQueue, &byte, 0) == pdTRUE)
+      // Bound each pass so continuous input cannot starve other firmware work.
+      for (size_t budget = 0; budget < rxQueueSize; ++budget) {
+        {
+          StateLock lock;
+          if (parserGeneration != transport.generation || !transport.pop(byte)) break;
+        }
         processReceivedByte(byte);
+      }
     }
 
     void setup() {
@@ -250,20 +354,15 @@ namespace RFLink {
       }
       Config::ConfigItem *deviceName = Config::findConfigItem(jsonNameDeviceName, Config::SectionId::BLE_id);
 
-      if (rxQueue == nullptr)
-        rxQueue = xQueueCreate(rxQueueSize, sizeof(char));
-
-      if (rxQueue == nullptr) {
-        Serial.println(F("Failed to allocate BLE receive queue"));
-        return;
-      }
-
       resetCommandBuffer();
       const char *name = deviceName != nullptr ? deviceName->getCharValue() : "RFLink32";
       if (!NimBLEDevice::init(name)) {
         Serial.println(F("Failed to initialize BLE"));
         return;
       }
+      // The radio is initialized, so esp_random has hardware entropy.
+      bootId = (static_cast<uint64_t>(esp_random()) << 32) | esp_random();
+      ble_npl_event_init(&statusEvent, sendStatusEvent, nullptr);
       NimBLEDevice::setSecurityAuth(true, true, true); // Bonding, MITM, Secure Connections.
       NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
       // Keep NimBLE's default key distribution, NVS storage and oldest-bond eviction.
@@ -278,12 +377,19 @@ namespace RFLink {
               txCharacteristicUuid,
               NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN,
               maxNotificationSize);
+      txCharacteristic->setCallbacks(&subscriptionCallbacks);
 
       NimBLECharacteristic *rxCharacteristic = service->createCharacteristic(
               rxCharacteristicUuid,
               NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR |
               NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN);
       rxCharacteristic->setCallbacks(&rxCallbacks);
+
+      NimBLEService *statusService = server->createService(statusServiceUuid);
+      statusCharacteristic = statusService->createCharacteristic(
+              statusCharacteristicUuid, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY |
+              NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN, 17);
+      statusCharacteristic->setCallbacks(&subscriptionCallbacks);
 
       // NimBLE 2.x starts the GATT server, including all services, when advertising starts.
       NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
@@ -322,10 +428,24 @@ namespace RFLink {
     void getStatusJsonString(JsonObject &output) {
       JsonObject status = output.createNestedObject(F("ble"));
       status[F("status")] = running ? F("running") : F("disabled");
-      status[F("connected")] = connected.load();
-      status[F("rx_dropped_bytes")] = droppedRxBytes;
-      status[F("tx_dropped_bytes")] = droppedTxBytes;
-      status[F("tx_failed_notifications")] = failedNotifications;
+      bool connected, ready;
+      uint8_t reason;
+      uint32_t session;
+      {
+        StateLock lock;
+        connected = transport.handle != State::noHandle;
+        ready = transport.reason() == State::Reason::Ready;
+        reason = static_cast<uint8_t>(transport.reason());
+        session = connected ? transport.generation : 0;
+      }
+      status[F("connected")] = connected;
+      status[F("ready")] = ready;
+      status[F("reason")] = reason;
+      status[F("session_id")] = session;
+      status[F("rx_dropped_bytes")] = droppedRxBytes.load();
+      status[F("tx_dropped_bytes")] = droppedTxBytes.load();
+      status[F("tx_failed_notifications")] = failedNotifications.load();
+      status[F("status_failed_notifications")] = failedStatusNotifications.load();
     }
 
   }
