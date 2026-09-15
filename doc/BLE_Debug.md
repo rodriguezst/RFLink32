@@ -45,7 +45,7 @@ El capturador tiene un coste limitado, pero no es una medida exacta de tiempos d
 
 ## Inventario GATT al arrancar
 
-El firmware de debug imprime además **tres líneas fijas al arrancar**, una por RX, TX y estado, después de registrar los servicios y arrancar el anuncio. Este informe de arranque se imprime desde setup; no forma parte del presupuesto periódico de 128 bytes/100 ms ni se ejecuta en callbacks.
+El firmware de debug imprime además **tres líneas fijas al arrancar**, una por RX, TX y estado, después de registrar los servicios y arrancar el anuncio. Este informe de arranque se imprime desde setup antes de arrancar la tarea de resúmenes, para evitar que esta intercale sus líneas; no forma parte del presupuesto periódico de 128 bytes/100 ms ni se ejecuta en callbacks.
 
 Cada línea `[BLEDBG] ... gatt` consulta la tabla del stack mediante `ble_gatts_find_svc` y `ble_gatts_find_chr`. `svc_rc=0` y `chr_rc=0`, con handles no nulos, confirman que esa característica está registrada bajo ese servicio. `decl_h` es el handle de declaración y `value_h` el de valor; no son connection handles. `props` son flags internos NimBLE, incluidos los de seguridad, no el valor bruto de CBCharacteristicProperties.
 

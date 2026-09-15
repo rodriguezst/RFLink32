@@ -548,10 +548,6 @@ namespace RFLink {
       advertising->setName(name);
       advertising->setPreferredParams(0x06, 0x12);
 
-#ifdef RFLINK_BLE_DEBUG
-      if (!diagnostics.start(diagnosticSnapshot))
-        Serial.println(F("BLE USB diagnostics task allocation failed"));
-#endif
       running = NimBLEDevice::startAdvertising();
       if (!running) {
         Serial.println(F("Failed to start BLE advertising"));
@@ -563,6 +559,10 @@ namespace RFLink {
       reportGattRegistration(statusService, statusCharacteristic);
 #endif
       Serial.printf("BLE UART service started; bonds %d/%d\r\n", NimBLEDevice::getNumBonds(), maxBonds);
+#ifdef RFLINK_BLE_DEBUG
+      if (!diagnostics.start(diagnosticSnapshot))
+        Serial.println(F("BLE USB diagnostics task allocation failed"));
+#endif
     }
 
     void broadcastMessage(const char *message) {
