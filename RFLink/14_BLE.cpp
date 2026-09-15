@@ -5,6 +5,7 @@
 #include "3_Serial.h"
 #include "RFLink.h"
 #include "BLETransportState.h"
+#include "BLEDiagnostics.h"
 
 #include <NimBLEDevice.h>
 #include <atomic>
@@ -63,11 +64,64 @@ namespace RFLink {
       std::atomic<unsigned long> failedStatusNotifications{0};
       uint32_t parserGeneration = 0; // Command consumer only.
 
+#ifdef RFLINK_BLE_DEBUG
+      Diagnostics diagnostics;
+      uint8_t diagnosticSecurity = 0, diagnosticKeySize = 0; // stateMux
+
+      uint8_t securityFlags(NimBLEConnInfo &info) {
+        return info.isEncrypted() | (info.isAuthenticated() << 1) | (info.isBonded() << 2);
+      }
+      // Caller holds stateMux; capture only bounded records, never format/print.
+      void trace(const char *name, const char *result, NimBLEConnInfo *info = nullptr,
+                 size_t bytes = 0, int detail = 0) {
+        const uint16_t handle = info ? info->getConnHandle() : transport.handle;
+        const uint8_t security = info ? securityFlags(*info) : diagnosticSecurity;
+        const uint8_t key = info ? info->getSecKeySize() : diagnosticKeySize;
+        if (info && transport.matches(handle)) {
+          diagnosticSecurity = security;
+          diagnosticKeySize = key;
+        }
+        diagnostics.record({millis(), transport.generation, handle, static_cast<uint16_t>(bytes),
+                            security, key, name, result, detail});
+      }
+      const char *writeResultName(State::WriteResult result, NimBLEConnInfo &info) {
+        switch (result) {
+          case State::WriteResult::Accepted: return "accepted";
+          case State::WriteResult::WrongConnection: return "wrong_connection";
+          case State::WriteResult::Security:
+            if (!info.isEncrypted()) return "not_encrypted";
+            if (!info.isAuthenticated()) return "not_authenticated";
+            if (!info.isBonded()) return "not_bonded";
+            if (info.getSecKeySize() != 16) return "key_size";
+            return "auth_callback_pending";
+          case State::WriteResult::Consumer: return "consumer_pending";
+          case State::WriteResult::Cleanup: return "cleanup_pending";
+          case State::WriteResult::ResponseSubscription: return "tx_unsubscribed";
+          case State::WriteResult::Overflow: return "queue_overflow";
+        }
+        return "unknown";
+      }
+      Diagnostics::Snapshot diagnosticSnapshot() {
+        StateLock lock;
+        return {transport.generation, static_cast<uint32_t>(droppedRxBytes.load()),
+                static_cast<uint32_t>(failedStatusNotifications.load()), transport.handle,
+                static_cast<uint16_t>(transport.count), static_cast<uint8_t>(transport.reason()),
+                diagnosticSecurity, diagnosticKeySize};
+      }
+#define BLE_TRACE(...) trace(__VA_ARGS__)
+#else
+#define BLE_TRACE(...) do {} while (0)
+#endif
+
       char commandBuffer[INPUT_COMMAND_SIZE];
       size_t commandLength = 0;
       bool discardUntilNewline = false;
 
       void resetCommandBuffer() {
+#ifdef RFLINK_BLE_DEBUG
+        diagnostics.parserBytes = 0;
+        diagnostics.discarding = false;
+#endif
         commandBuffer[0] = 0;
         commandLength = 0;
         discardUntilNewline = false;
@@ -94,6 +148,7 @@ namespace RFLink {
           send = transport.dirty && transport.secure && transport.statusSubscribed && handle != State::noHandle;
           transport.encode(bootId, INPUT_COMMAND_SIZE - 1, value);
           if (send) {
+            BLE_TRACE("status_notify", "attempt", nullptr, sizeof(value), value[14]);
             transport.dirty = false;
             nextStatusAttempt = 0;
           }
@@ -101,6 +156,7 @@ namespace RFLink {
         if (send && !statusCharacteristic->notify(value, sizeof(value), handle)) {
           failedStatusNotifications++;
           StateLock lock;
+          BLE_TRACE("status_notify", "failed");
           transport.dirty = true;
           nextStatusAttempt = millis() + 250;
         }
@@ -114,18 +170,28 @@ namespace RFLink {
           {
             StateLock lock;
             transport.connect(info.getConnHandle());
+            BLE_TRACE("connect", "current", &info);
             nextStatusAttempt = 0;
           }
           restartAdvertisingRequested = false;
-          if (!NimBLEDevice::startSecurity(info.getConnHandle()))
+          if (!NimBLEDevice::startSecurity(info.getConnHandle())) {
+            {
+              StateLock lock;
+              BLE_TRACE("security_start", "failed", &info);
+            }
             server->disconnect(info.getConnHandle());
+          }
         }
 
         void onDisconnect(NimBLEServer *, NimBLEConnInfo &info, int reason) override {
           (void) reason;
           {
             StateLock lock;
+            BLE_TRACE("disconnect", transport.matches(info.getConnHandle()) ? "current" : "ignored", &info, 0, reason);
             if (!transport.disconnect(info.getConnHandle())) return;
+#ifdef RFLINK_BLE_DEBUG
+            diagnosticSecurity = diagnosticKeySize = 0;
+#endif
           }
           pendingPasskey = UINT32_MAX;
           restartAdvertisingRequested = true;
@@ -143,6 +209,7 @@ namespace RFLink {
           const bool secure = meetsSecurity(info);
           {
             StateLock lock;
+            BLE_TRACE("authentication", transport.matches(info.getConnHandle()) ? (secure ? "accepted" : "rejected") : "ignored", &info);
             if (!transport.authenticate(info.getConnHandle(), secure)) return;
           }
           if (!secure) NimBLEDevice::getServer()->disconnect(info.getConnHandle());
@@ -157,11 +224,23 @@ namespace RFLink {
 
       class RxCallbacks : public NimBLECharacteristicCallbacks {
         void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &info) override {
+#ifdef RFLINK_BLE_DEBUG
+          diagnostics.writes++;
+          diagnostics.lastWrite = millis();
+#endif
           const auto &value = characteristic->getValue();
           StateLock lock;
+          BLE_TRACE("write_enter", "entered", &info, value.size());
           const auto result = transport.write(info.getConnHandle(), meetsSecurity(info),
                                                reinterpret_cast<const char *>(value.data()), value.size());
           if (result != State::WriteResult::Accepted) droppedRxBytes += value.size();
+#ifdef RFLINK_BLE_DEBUG
+          if (result == State::WriteResult::Accepted) {
+            diagnostics.accepted++;
+            diagnostics.enqueued += value.size();
+          } else diagnostics.rejected++;
+#endif
+          BLE_TRACE("write_result", writeResultName(result, info), &info, value.size(), static_cast<int>(result));
         }
       };
 
@@ -170,6 +249,7 @@ namespace RFLink {
           if (characteristic != statusCharacteristic || code == 0) return;
           failedStatusNotifications++;
           StateLock lock;
+          BLE_TRACE("status_completion", "failed_no_peer_id", nullptr, 0, code);
           // This callback has no peer identity. Request a fresh snapshot only;
           // never change readiness or security based on an old completion.
           transport.dirty = true;
@@ -177,6 +257,8 @@ namespace RFLink {
         }
         void onSubscribe(NimBLECharacteristic *characteristic, NimBLEConnInfo &info, uint16_t value) override {
           StateLock lock;
+          BLE_TRACE(characteristic == statusCharacteristic ? "status_subscribe" : "tx_subscribe",
+                    transport.matches(info.getConnHandle()) ? "current" : "ignored", &info, 0, value);
           transport.subscribe(info.getConnHandle(), characteristic == statusCharacteristic, (value & 1) != 0);
         }
         void onRead(NimBLECharacteristic *characteristic, NimBLEConnInfo &info) override {
@@ -186,6 +268,7 @@ namespace RFLink {
           {
             StateLock lock;
             allowed = transport.matches(info.getConnHandle()) && meetsSecurity(info);
+            BLE_TRACE("status_read", allowed ? "accepted" : "rejected", &info);
             transport.encode(bootId, INPUT_COMMAND_SIZE - 1, value);
           }
           // ATT enforces READ_ENC/READ_AUTHEN; also withhold the value if
@@ -257,10 +340,16 @@ namespace RFLink {
           StateLock lock;
           if (parserGeneration != transport.generation ||
               (transport.reason() != State::Reason::Ready && transport.reason() != State::Reason::QueueFull)) {
+#ifdef RFLINK_BLE_DEBUG
+            diagnostics.parserDropped += commandLength;
+#endif
             resetCommandBuffer();
             return;
           }
         }
+#ifdef RFLINK_BLE_DEBUG
+        diagnostics.commands++;
+#endif
         commandBuffer[commandLength] = 0;
         RFLink::sendRawPrint(F("\33[2K\r"));
         RFLink::sendRawPrint(F("Message arrived [BLE]:"));
@@ -273,6 +362,9 @@ namespace RFLink {
       void processReceivedByte(char byte) {
         if (byte == '\r' || byte == '\n') {
           if (discardUntilNewline) {
+#ifdef RFLINK_BLE_DEBUG
+            diagnostics.parserDropped++;
+#endif
             resetCommandBuffer();
             return;
           }
@@ -282,10 +374,17 @@ namespace RFLink {
           return;
         }
 
-        if (discardUntilNewline)
+        if (discardUntilNewline) {
+#ifdef RFLINK_BLE_DEBUG
+          diagnostics.parserDropped++;
+#endif
           return;
+        }
 
         if (commandLength >= INPUT_COMMAND_SIZE - 1) {
+#ifdef RFLINK_BLE_DEBUG
+          diagnostics.parserDropped += commandLength + 1;
+#endif
           discardUntilNewline = true;
           commandLength = 0;
           broadcastMessage(F("Error: BLE command is too long and was ignored\r\n"));
@@ -308,6 +407,9 @@ namespace RFLink {
       if (!running)
         return;
 
+#ifdef RFLINK_BLE_DEBUG
+      diagnostics.lastConsumer = millis();
+#endif
       const uint32_t passkey = pendingPasskey.exchange(UINT32_MAX);
       if (passkey != UINT32_MAX)
         Serial.printf("BLE pairing PIN: %06lu\r\n", static_cast<unsigned long>(passkey));
@@ -316,11 +418,24 @@ namespace RFLink {
       {
         StateLock lock;
         if (transport.cleanup && (!transport.overflow || transport.handle == State::noHandle)) {
+          BLE_TRACE("queue_reset", "consumer", nullptr, transport.count);
+#ifdef RFLINK_BLE_DEBUG
+          diagnostics.resets++;
+          diagnostics.parserDropped += commandLength;
+          diagnostics.resetBytes += transport.count;
+#endif
           resetCommandBuffer();
           droppedRxBytes += transport.clean();
           parserGeneration = transport.generation;
         }
+#ifdef RFLINK_BLE_DEBUG
+        const auto previousReason = transport.reason();
+#endif
         transport.publishReady(); // Only the initialized consumer may publish READY.
+#ifdef RFLINK_BLE_DEBUG
+        if (previousReason != transport.reason())
+          BLE_TRACE("availability", "consumer", nullptr, 0, static_cast<int>(transport.reason()));
+#endif
         advertise = transport.handle == State::noHandle;
         notifyStatus = transport.overflow || (transport.dirty && transport.secure && transport.statusSubscribed &&
                        (nextStatusAttempt == 0 || static_cast<int32_t>(millis() - nextStatusAttempt) >= 0));
@@ -337,8 +452,15 @@ namespace RFLink {
         {
           StateLock lock;
           if (parserGeneration != transport.generation || !transport.pop(byte)) break;
+#ifdef RFLINK_BLE_DEBUG
+          diagnostics.consumed++;
+#endif
         }
         processReceivedByte(byte);
+#ifdef RFLINK_BLE_DEBUG
+        diagnostics.parserBytes = commandLength;
+        diagnostics.discarding = discardUntilNewline;
+#endif
       }
     }
 
@@ -398,6 +520,10 @@ namespace RFLink {
       advertising->setName(name);
       advertising->setPreferredParams(0x06, 0x12);
 
+#ifdef RFLINK_BLE_DEBUG
+      if (!diagnostics.start(diagnosticSnapshot))
+        Serial.println(F("BLE USB diagnostics task allocation failed"));
+#endif
       running = NimBLEDevice::startAdvertising();
       if (!running) {
         Serial.println(F("Failed to start BLE advertising"));
