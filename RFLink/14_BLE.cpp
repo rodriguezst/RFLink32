@@ -129,7 +129,7 @@ namespace RFLink {
               !connInfo.isEncrypted() || !connInfo.isAuthenticated() || !connInfo.isBonded())
             return;
 
-          std::string value = characteristic->getValue();
+          const auto &value = characteristic->getValue();
 
           // The NimBLE host is the only producer; the consumer can only free
           // space. Reserve enough room for the whole write before adding bytes.
