@@ -6,6 +6,10 @@
 
 namespace RFLink { namespace BLE {
 
+inline bool transportSecuritySatisfied(bool encrypted, bool authenticated, bool bonded, uint8_t keySize) {
+  return encrypted && authenticated && bonded && keySize == 16;
+}
+
 // All access is serialized by the caller. No BLE/RTOS calls or allocation here.
 template<size_t Capacity>
 struct TransportState {
@@ -17,6 +21,10 @@ struct TransportState {
     Accepted, WrongConnection, Security, Consumer, Cleanup,
     ResponseSubscription, Overflow
   };
+  struct Session {
+    uint16_t handle;
+    uint32_t generation;
+  };
   static constexpr uint16_t noHandle = 0xffff;
   uint16_t handle = noHandle;
   uint32_t generation = 0;
@@ -27,6 +35,21 @@ struct TransportState {
   char bytes[Capacity];
 
   bool matches(uint16_t peer) const { return handle != noHandle && handle == peer; }
+  Session session() const { return {handle, generation}; }
+  bool matches(Session expected) const {
+    return matches(expected.handle) && generation == expected.generation;
+  }
+  // A snapshot belongs to the session that requested it, even if handles are reused.
+  // Reconciliation can revoke READY, but only the consumer may publish it.
+  bool reconcile(Session expected, bool security, bool tx, bool status) {
+    if (!matches(expected)) return false;
+    if (secure != security || txSubscribed != tx || statusSubscribed != status) dirty = true;
+    secure = security;
+    txSubscribed = tx;
+    statusSubscribed = status;
+    if (!secure || !txSubscribed) publishedReady = false;
+    return true;
+  }
   Reason reason() const {
     if (handle == noHandle) return Reason::Disconnected;
     if (!secure) return Reason::Security;

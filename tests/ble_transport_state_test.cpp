@@ -18,6 +18,58 @@ static void ready(State &s, uint16_t peer = 7) {
 }
 
 int main() {
+  // The same security predicate is used for callbacks and live reconciliation.
+  for (int bits = 0; bits < 8; ++bits) {
+    for (uint8_t key : {uint8_t(0), uint8_t(7), uint8_t(15), uint8_t(16)}) {
+      assert(RFLink::BLE::transportSecuritySatisfied(bits & 1, bits & 2, bits & 4, key) ==
+             (bits == 7 && key == 16));
+    }
+  }
+
+  // NimBLE 2.5.1 can restore encryption/CCCDs before delivering CONNECT.
+  State delayed;
+  assert(!delayed.authenticate(0, true));
+  assert(!delayed.subscribe(0, false, true));
+  assert(!delayed.subscribe(0, true, true));
+  assert(delayed.generation == 0 && delayed.reason() == Reason::Disconnected);
+  delayed.connect(0);
+  auto current = delayed.session();
+  // Only a fresh live snapshot may recover those facts; no callback replay.
+  assert(delayed.reconcile(current, true, true, true));
+  delayed.publishReady();
+  assert(delayed.reason() != Reason::Ready); // Cleanup/consumer still required.
+  delayed.clean();
+  assert(delayed.reason() != Reason::Ready);
+  delayed.publishReady();
+  assert(delayed.reason() == Reason::Ready);
+  assert(delayed.write(0, true, "10;PING;\n", 9) == Result::Accepted);
+
+  // Deferred work from a previous incarnation of handle 0 must do nothing.
+  const auto old = current;
+  delayed.disconnect(0);
+  assert(!delayed.reconcile(old, true, true, true));
+  delayed.connect(0);
+  current = delayed.session();
+  assert(current.generation != old.generation);
+  assert(!delayed.reconcile(old, true, true, true));
+  assert(!delayed.secure && !delayed.txSubscribed && !delayed.statusSubscribed);
+  assert(delayed.clean() == 9);
+  assert(delayed.reconcile(current, true, true, false)); // Legacy client is valid.
+  delayed.publishReady();
+  assert(delayed.reason() == Reason::Ready);
+  assert(!delayed.reconcile(old, false, false, false)); // Cannot revoke new READY either.
+  assert(delayed.reason() == Reason::Ready);
+
+  // Recover/revoke against actual CCCDs, never persisted bond subscriptions.
+  assert(delayed.reconcile(current, true, false, true));
+  assert(delayed.reason() == Reason::ResponseSubscription);
+  assert(delayed.reconcile(current, true, true, true));
+  assert(delayed.reason() == Reason::Consumer); // Reconciliation cannot publish READY.
+  delayed.publishReady();
+  assert(delayed.reconcile(current, false, true, true));
+  assert(delayed.reason() == Reason::Security);
+  delayed.publishReady();
+  assert(delayed.reason() == Reason::Security);
   // Every ordering of authentication, TX CCCD, status CCCD and consumer cleanup.
   int order[] = {0, 1, 2, 3};
   do {
@@ -108,5 +160,5 @@ int main() {
   s.generation = UINT32_MAX;
   s.connect(8);
   assert(s.generation == 1); // Zero is reserved for no active session.
-  std::puts("BLE transport state tests passed (24 event orderings, reconnect, security, queue, format)");
+  std::puts("BLE transport state tests passed (24 event orderings, early events, live recovery, stale generations, security, queue, format)");
 }

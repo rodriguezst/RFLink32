@@ -8,6 +8,7 @@
 #include "BLEDiagnostics.h"
 
 #include <NimBLEDevice.h>
+#include "BLELiveConnection.h"
 #include <atomic>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
@@ -52,7 +53,11 @@ namespace RFLink {
         ~StateLock() { portEXIT_CRITICAL(&stateMux); }
       };
       uint64_t bootId = 0;
+      uint16_t txCccdHandle = 0, statusCccdHandle = 0;
       ble_npl_event statusEvent;
+      State::Session requestedSession{State::noHandle, 0}; // stateMux; one queued host event
+      uint32_t nextReconciliation = 0; // stateMux; bounded live-state refresh
+      constexpr uint32_t reconciliationIntervalMs = 250;
       std::atomic<bool> statusEventPending{false};
       uint32_t nextStatusAttempt = 0; // Protected by stateMux.
       bool running = false;
@@ -147,12 +152,39 @@ namespace RFLink {
       }
 
       bool meetsSecurity(NimBLEConnInfo &info) {
-        return info.isEncrypted() && info.isAuthenticated() && info.isBonded() && info.getSecKeySize() == 16;
+        return transportSecuritySatisfied(info.isEncrypted(), info.isAuthenticated(), info.isBonded(), info.getSecKeySize());
       }
 
       // Runs on the NimBLE host, serialized with connection/security callbacks.
       // Explicit payloads avoid sharing the READ value with the command task.
       void sendStatusEvent(ble_npl_event *) {
+        State::Session expected;
+        {
+          StateLock lock;
+          expected = requestedSession;
+          if (!transport.matches(expected)) {
+            statusEventPending = false;
+            return;
+          }
+        }
+        // CONNECT can be delivered after ENC_CHANGE/CCCD restoration in NimBLE
+        // 2.5.1. Recover from the live stack, never replay an early callback.
+        const auto live = readLiveConnection(expected.handle, txCccdHandle, statusCccdHandle);
+        {
+          StateLock lock;
+          if (!transport.matches(expected)) {
+            statusEventPending = false;
+            return;
+          }
+          if (!live.exists) {
+            pendingPasskey = UINT32_MAX;
+            transport.disconnect(expected.handle);
+            restartAdvertisingRequested = true;
+            statusEventPending = false;
+            return;
+          }
+          transport.reconcile(expected, live.secure, live.txSubscribed, live.statusSubscribed);
+        }
         uint8_t value[17];
         uint16_t handle;
         bool send, overflow;
@@ -160,7 +192,8 @@ namespace RFLink {
           StateLock lock;
           handle = transport.handle;
           overflow = transport.overflow && handle != State::noHandle;
-          send = transport.dirty && transport.secure && transport.statusSubscribed && handle != State::noHandle;
+          send = transport.dirty && transport.secure && transport.statusSubscribed && handle != State::noHandle &&
+                 (nextStatusAttempt == 0 || static_cast<int32_t>(millis() - nextStatusAttempt) >= 0);
           transport.encode(bootId, INPUT_COMMAND_SIZE - 1, value);
           if (send) {
             BLE_TRACE("status_notify", "attempt", nullptr, sizeof(value), value[14]);
@@ -185,11 +218,14 @@ namespace RFLink {
           {
             StateLock lock;
             transport.connect(info.getConnHandle());
+            // This descriptor is already secured if encryption beat CONNECT.
+            transport.authenticate(info.getConnHandle(), meetsSecurity(info));
+            nextReconciliation = 0;
             BLE_TRACE("connect", "current", &info);
             nextStatusAttempt = 0;
           }
           restartAdvertisingRequested = false;
-          if (!NimBLEDevice::startSecurity(info.getConnHandle())) {
+          if (!meetsSecurity(info) && !NimBLEDevice::startSecurity(info.getConnHandle())) {
             {
               StateLock lock;
               BLE_TRACE("security_start", "failed", &info);
@@ -200,10 +236,13 @@ namespace RFLink {
 
         void onDisconnect(NimBLEServer *, NimBLEConnInfo &info, int reason) override {
           (void) reason;
+          // A reused live handle must not be invalidated by an old disconnect.
+          // NimBLE removes the actual connection before delivering DISCONNECT.
+          if (ble_gap_conn_find(info.getConnHandle(), nullptr) == 0) return;
           {
             StateLock lock;
             BLE_TRACE("disconnect", transport.matches(info.getConnHandle()) ? "current" : "ignored", &info, 0, reason);
-            if (!transport.disconnect(info.getConnHandle())) return;
+            if (!transport.disconnect(info.getConnHandle()) && transport.handle != State::noHandle) return;
 #ifdef RFLINK_BLE_DEBUG
             diagnosticSecurity = diagnosticKeySize = 0;
 #endif
@@ -430,6 +469,7 @@ namespace RFLink {
         Serial.printf("BLE pairing PIN: %06lu\r\n", static_cast<unsigned long>(passkey));
 
       bool advertise, notifyStatus;
+      bool queueHostEvent = false;
       {
         StateLock lock;
         if (transport.cleanup && (!transport.overflow || transport.handle == State::noHandle)) {
@@ -454,11 +494,19 @@ namespace RFLink {
         advertise = transport.handle == State::noHandle;
         notifyStatus = transport.overflow || (transport.dirty && transport.secure && transport.statusSubscribed &&
                        (nextStatusAttempt == 0 || static_cast<int32_t>(millis() - nextStatusAttempt) >= 0));
+        const uint32_t now = millis();
+        const bool reconcile = transport.handle != State::noHandle &&
+                               (nextReconciliation == 0 || static_cast<int32_t>(now - nextReconciliation) >= 0);
+        if ((notifyStatus || reconcile) && !statusEventPending.exchange(true)) {
+          requestedSession = transport.session();
+          nextReconciliation = now + reconciliationIntervalMs;
+          queueHostEvent = true;
+        }
       }
 
       if (advertise && restartAdvertisingRequested.exchange(false))
         NimBLEDevice::startAdvertising();
-      if (notifyStatus && !statusEventPending.exchange(true))
+      if (queueHostEvent)
         ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &statusEvent);
 
       char byte;
@@ -533,6 +581,14 @@ namespace RFLink {
       // firmware upgrade/cold boot otherwise leaves bonded clients' caches stale.
       if (!server->start()) {
         Serial.println(F("Failed to register BLE GATT database"));
+        return;
+      }
+      const NimBLEUUID cccdUuid(static_cast<uint16_t>(0x2902));
+      if (ble_gatts_find_dsc(service->getUUID().getBase(), txCharacteristic->getUUID().getBase(),
+                            cccdUuid.getBase(), &txCccdHandle) != 0 ||
+          ble_gatts_find_dsc(statusService->getUUID().getBase(), statusCharacteristic->getUUID().getBase(),
+                            cccdUuid.getBase(), &statusCccdHandle) != 0) {
+        Serial.println(F("Failed to locate BLE subscription descriptors"));
         return;
       }
       // Conservatively invalidate once per boot, never on each connection.
