@@ -60,21 +60,33 @@ namespace RFLink {
         Serial.println(F("BLE settings saved; reboot required to apply"));
       }
 
+      bool meetsSecurity(const NimBLEConnInfo &connInfo) {
+        return connInfo.isEncrypted() && connInfo.isAuthenticated() &&
+               connInfo.isBonded() && connInfo.getSecKeySize() == 16;
+      }
+
       class ServerCallbacks : public NimBLEServerCallbacks {
         void onConnect(NimBLEServer *connectedServer, NimBLEConnInfo &connInfo) override {
           authenticated = false;
           connectionHandle = connInfo.getConnHandle();
           connectionGeneration++;
+          // NimBLE can deliver CONNECT after ENC_CHANGE; its descriptor is live.
+          authenticated = meetsSecurity(connInfo);
           connected = true;
           restartAdvertisingRequested = false;
-          if (!NimBLEDevice::startSecurity(connInfo.getConnHandle()))
+          if (!authenticated && !NimBLEDevice::startSecurity(connInfo.getConnHandle()))
             connectedServer->disconnect(connInfo.getConnHandle());
         }
 
         void onDisconnect(NimBLEServer *disconnectedServer, NimBLEConnInfo &connInfo, int reason) override {
           (void) disconnectedServer;
-          (void) connInfo;
           (void) reason;
+          // NimBLE removes the connection before DISCONNECT. Ignore stale events
+          // for a reused live handle, or for a different current connection.
+          if (ble_gap_conn_find(connInfo.getConnHandle(), nullptr) == 0 ||
+              (connectionHandle != BLE_HS_CONN_HANDLE_NONE && connectionHandle != connInfo.getConnHandle()))
+            return;
+
           authenticated = false;
           connected = false;
           connectionHandle = BLE_HS_CONN_HANDLE_NONE;
@@ -94,8 +106,7 @@ namespace RFLink {
         }
 
         void onAuthenticationComplete(NimBLEConnInfo &connInfo) override {
-          authenticated = connInfo.isEncrypted() && connInfo.isAuthenticated() &&
-                          connInfo.isBonded() && connInfo.getSecKeySize() == 16;
+          authenticated = meetsSecurity(connInfo);
           if (!authenticated) {
             Serial.println(F("BLE authentication failed; UART access denied"));
             NimBLEDevice::getServer()->disconnect(connInfo.getConnHandle());
